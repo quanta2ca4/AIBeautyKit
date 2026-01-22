@@ -3,11 +3,15 @@ package apero.quanta.opencvapp.feature.editor
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.util.AttributeSet
+import android.view.MotionEvent
 import android.view.View
 import com.google.mlkit.vision.common.PointF3D
 import com.google.mlkit.vision.facemesh.FaceMesh
 import com.google.mlkit.vision.facemesh.FaceMeshPoint
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 class ImageWarpView @JvmOverloads constructor(
@@ -22,8 +26,40 @@ class ImageWarpView @JvmOverloads constructor(
     private val count = (meshWidth + 1) * (meshHeight + 1)
     private val verts = FloatArray(count * 2)
     private val originalVerts = FloatArray(count * 2)
+    
+    // For manual warping (Liquify)
+    private val manualVertsOffset = FloatArray(count * 2)
+    private var lastX = 0f
+    private var lastY = 0f
+    private val brushRadius = 150f
+    private val brushStrength = 0.5f
+
+    // Cached view transform for touch mapping
+    private var viewScale = 1f
+    private var viewDx = 0f
+    private var viewDy = 0f
 
     private var faceMesh: FaceMesh? = null
+    // Cached warp parameters
+    private var cachedLeftEyeCenter: PointF3D? = null
+    private var cachedRightEyeCenter: PointF3D? = null
+    private var cachedLeftRadius: Float = 0f
+    private var cachedRightRadius: Float = 0f
+    private var cachedChinPoint: PointF3D? = null
+
+    private val meshPaint = Paint().apply {
+        color = Color.CYAN
+        style = Paint.Style.STROKE
+        strokeWidth = 1f
+        alpha = 100
+    }
+
+    private val pointPaint = Paint().apply {
+        color = Color.RED
+        style = Paint.Style.FILL
+        strokeWidth = 4f
+        strokeCap = Paint.Cap.ROUND
+    }
     
     // Face Mesh Indices for Eyes (Standard 468 landmarks)
     private val LEFT_EYE_INDICES = listOf(33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7)
@@ -45,11 +81,79 @@ class ImageWarpView @JvmOverloads constructor(
     fun setImage(bmp: Bitmap) {
         this.bitmap = bmp
         initializeMesh(bmp.width.toFloat(), bmp.height.toFloat())
+        // Reset manual offsets for new image
+        for (i in manualVertsOffset.indices) manualVertsOffset[i] = 0f
         invalidate()
     }
 
     fun setFaceMesh(mesh: FaceMesh) {
         this.faceMesh = mesh
+        updateWarpParameters()
+        applyWarp()
+    }
+
+    fun getWarpedBitmap(): Bitmap? {
+        val src = bitmap ?: return null
+        val result = Bitmap.createBitmap(src.width, src.height, src.config ?: Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(result)
+        canvas.drawBitmapMesh(src, meshWidth, meshHeight, verts, 0, null, 0, null)
+        return result
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (bitmap == null) return false
+
+        // Map touch coordinates to bitmap coordinates
+        val bx = (event.x - viewDx) / viewScale
+        val by = (event.y - viewDy) / viewScale
+
+        when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                lastX = bx
+                lastY = by
+            }
+            MotionEvent.ACTION_MOVE -> {
+                handleManualWarp(bx, by)
+                lastX = bx
+                lastY = by
+                applyWarp()
+            }
+        }
+        return true
+    }
+
+    private fun handleManualWarp(currentX: Float, currentY: Float) {
+        val dx = currentX - lastX
+        val dy = currentY - lastY
+        
+        for (i in 0 until count) {
+            val ox = originalVerts[i * 2]
+            val oy = originalVerts[i * 2 + 1]
+            
+            val dist = sqrt((currentX - ox).pow(2) + (currentY - oy).pow(2))
+            if (dist < brushRadius) {
+                val weight = (1 - dist / brushRadius).pow(2)
+                manualVertsOffset[i * 2] += dx * weight * brushStrength
+                manualVertsOffset[i * 2 + 1] += dy * weight * brushStrength
+            }
+        }
+    }
+
+    private fun updateWarpParameters() {
+        val mesh = faceMesh ?: return
+        val meshPoints = mesh.allPoints
+        if (meshPoints.isEmpty()) return
+
+        val leftEyePoints = getPoints(meshPoints, LEFT_EYE_INDICES)
+        val rightEyePoints = getPoints(meshPoints, RIGHT_EYE_INDICES)
+
+        cachedLeftEyeCenter = computeCenter(leftEyePoints)
+        cachedRightEyeCenter = computeCenter(rightEyePoints)
+
+        cachedLeftRadius = if (cachedLeftEyeCenter != null) computeRadius(cachedLeftEyeCenter!!, leftEyePoints) * 1.5f else 0f
+        cachedRightRadius = if (cachedRightEyeCenter != null) computeRadius(cachedRightEyeCenter!!, rightEyePoints) * 1.5f else 0f
+        
+        cachedChinPoint = getPoint(meshPoints, 152)?.position
     }
 
     private fun initializeMesh(width: Float, height: Float) {
@@ -68,65 +172,52 @@ class ImageWarpView @JvmOverloads constructor(
     }
 
     private fun applyWarp() {
-        if (bitmap == null || faceMesh == null) return
+        if (bitmap == null) return
 
-        // Reset to original
-        System.arraycopy(originalVerts, 0, verts, 0, originalVerts.size)
-
-        val meshPoints = faceMesh!!.allPoints
-        if (meshPoints.isEmpty()) return
-
-        // 1. Calculate Centers and Radii
-        val leftEyePoints = getPoints(meshPoints, LEFT_EYE_INDICES)
-        val rightEyePoints = getPoints(meshPoints, RIGHT_EYE_INDICES)
-
-        val leftEyeCenter = computeCenter(leftEyePoints)
-        val rightEyeCenter = computeCenter(rightEyePoints)
-
-        val leftRadius = if (leftEyeCenter != null) computeRadius(leftEyeCenter, leftEyePoints) * 1.5f else 0f
-        val rightRadius = if (rightEyeCenter != null) computeRadius(rightEyeCenter, rightEyePoints) * 1.5f else 0f
-
-        // 2. Apply Warp to Mesh Vertices
+        // 1. Combine Original + Manual Offsets
         for (i in 0 until count) {
-            val ox = originalVerts[i * 2]
-            val oy = originalVerts[i * 2 + 1]
+            val baseStartX = originalVerts[i * 2] + manualVertsOffset[i * 2]
+            val baseStartY = originalVerts[i * 2 + 1] + manualVertsOffset[i * 2 + 1]
 
-            var totalDx = 0f
-            var totalDy = 0f
-
-            // Apply Left Eye Enlarge
-            if (leftEyeCenter != null && eyeEnlargementLevel > 0) {
-                val offset = calculateEnlargeOffset(ox, oy, leftEyeCenter.x, leftEyeCenter.y, leftRadius, eyeEnlargementLevel)
-                totalDx += offset.first
-                totalDy += offset.second
-            }
-
-            // Apply Right Eye Enlarge
-            if (rightEyeCenter != null && eyeEnlargementLevel > 0) {
-                val offset = calculateEnlargeOffset(ox, oy, rightEyeCenter.x, rightEyeCenter.y, rightRadius, eyeEnlargementLevel)
-                totalDx += offset.first
-                totalDy += offset.second
-            }
-            
-            // Apply Chin Slimming
-            if (chinSlimmingLevel > 0) {
-                val chinPoint = getPoint(meshPoints, 152)
-                if (chinPoint != null) {
-                    val cx = chinPoint.position.x
-                    val cy = chinPoint.position.y
-                    val r = 300f
-                    val s = 0.2f * chinSlimmingLevel
-                    val chinOffset = calculateSlimOffset(ox, oy, cx, cy, r, s)
-                    totalDx += chinOffset.first
-                    totalDy += chinOffset.second
-                }
-            }
-
-            verts[i * 2] = ox + totalDx
-            verts[i * 2 + 1] = oy + totalDy
+            // 2. Apply Automatic Effects (Face Mesh) on top
+            val warped = getWarpedPoint(baseStartX, baseStartY)
+            verts[i * 2] = warped.first
+            verts[i * 2 + 1] = warped.second
         }
 
         invalidate()
+    }
+
+    private fun getWarpedPoint(ox: Float, oy: Float): Pair<Float, Float> {
+        var totalDx = 0f
+        var totalDy = 0f
+
+        // Apply Left Eye Enlarge
+        if (cachedLeftEyeCenter != null && eyeEnlargementLevel > 0) {
+            val offset = calculateEnlargeOffset(ox, oy, cachedLeftEyeCenter!!.x, cachedLeftEyeCenter!!.y, cachedLeftRadius, eyeEnlargementLevel)
+            totalDx += offset.first
+            totalDy += offset.second
+        }
+
+        // Apply Right Eye Enlarge
+        if (cachedRightEyeCenter != null && eyeEnlargementLevel > 0) {
+            val offset = calculateEnlargeOffset(ox, oy, cachedRightEyeCenter!!.x, cachedRightEyeCenter!!.y, cachedRightRadius, eyeEnlargementLevel)
+            totalDx += offset.first
+            totalDy += offset.second
+        }
+
+        // Apply Chin Slimming
+        if (chinSlimmingLevel > 0 && cachedChinPoint != null) {
+            val cx = cachedChinPoint!!.x
+            val cy = cachedChinPoint!!.y
+            val r = 300f
+            val s = 0.2f * chinSlimmingLevel
+            val chinOffset = calculateSlimOffset(ox, oy, cx, cy, r, s)
+            totalDx += chinOffset.first
+            totalDy += chinOffset.second
+        }
+
+        return Pair(ox + totalDx, oy + totalDy)
     }
 
     private fun calculateEnlargeOffset(x: Float, y: Float, cx: Float, cy: Float, radius: Float, strength: Float): Pair<Float, Float> {
@@ -186,8 +277,50 @@ class ImageWarpView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
-        bitmap?.let {
-            canvas.drawBitmapMesh(it, meshWidth, meshHeight, verts, 0, null, 0, null)
+        val bmp = bitmap ?: return
+
+        // Calculate scale and translation to fit center
+        val viewWidth = width.toFloat()
+        val viewHeight = height.toFloat()
+        val bmpWidth = bmp.width.toFloat()
+        val bmpHeight = bmp.height.toFloat()
+
+        if (bmpWidth == 0f || bmpHeight == 0f) return
+
+        viewScale = kotlin.math.min(viewWidth / bmpWidth, viewHeight / bmpHeight)
+        viewDx = (viewWidth - bmpWidth * viewScale) / 2f
+        viewDy = (viewHeight - bmpHeight * viewScale) / 2f
+
+        canvas.save()
+        canvas.translate(viewDx, viewDy)
+        canvas.scale(viewScale, viewScale)
+
+        canvas.drawBitmapMesh(bmp, meshWidth, meshHeight, verts, 0, null, 0, null)
+
+        faceMesh?.let { mesh ->
+            // Draw triangles
+            for (triangle in mesh.allTriangles) {
+                val p1 = triangle.allPoints[0].position
+                val p2 = triangle.allPoints[1].position
+                val p3 = triangle.allPoints[2].position
+
+                val w1 = getWarpedPoint(p1.x, p1.y)
+                val w2 = getWarpedPoint(p2.x, p2.y)
+                val w3 = getWarpedPoint(p3.x, p3.y)
+
+                canvas.drawLine(w1.first, w1.second, w2.first, w2.second, meshPaint)
+                canvas.drawLine(w2.first, w2.second, w3.first, w3.second, meshPaint)
+                canvas.drawLine(w3.first, w3.second, w1.first, w1.second, meshPaint)
+            }
+
+            // Draw points
+            for (point in mesh.allPoints) {
+                val pos = point.position
+                val warped = getWarpedPoint(pos.x, pos.y)
+                canvas.drawPoint(warped.first, warped.second, pointPaint)
+            }
         }
+        
+        canvas.restore()
     }
 }

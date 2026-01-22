@@ -1,10 +1,12 @@
 package apero.quanta.opencvapp.feature.editor
 
+import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.provider.MediaStore
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -18,9 +20,43 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import java.io.OutputStream
 
 @Composable
 fun ImageEditorScreen() {
+// ... (code unchanged until the end of the file)
+
+fun saveBitmapToGallery(context: android.content.Context, bitmap: Bitmap) {
+    val filename = "Warped_${System.currentTimeMillis()}.jpg"
+    var fos: OutputStream? = null
+    val contentValues = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+        put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/OpenCVApp")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
+        }
+    }
+
+    val imageUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+
+    imageUri?.let { uri ->
+        try {
+            fos = context.contentResolver.openOutputStream(uri)
+            fos?.use {
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                contentValues.clear()
+                contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                context.contentResolver.update(uri, contentValues, null, null)
+            }
+            Toast.makeText(context, "Saved to Gallery!", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(context, "Save Failed: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+}
     val context = LocalContext.current
     var bitmap by remember { mutableStateOf<Bitmap?>(null) }
     var eyeEnlargement by remember { mutableFloatStateOf(0f) }
@@ -38,38 +74,71 @@ fun ImageEditorScreen() {
     // Reference to the custom view to update properties
     var warpView: ImageWarpView? by remember { mutableStateOf(null) }
 
+    fun detectFace(bmp: Bitmap) {
+        faceMeshHelper.processImage(bmp, 
+            onSuccess = { meshes ->
+                if (meshes.isNotEmpty()) {
+                    warpView?.setFaceMesh(meshes[0])
+                    Toast.makeText(context, "Face Detected!", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "No face detected.", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onFailure = {
+                Toast.makeText(context, "Detection Failed: ${it.message}", Toast.LENGTH_LONG).show()
+            }
+        )
+    }
+
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null) {
             val bmp = loadBitmapFromUri(context, uri)
             // Resize if too big to avoid OOM
             val scaledBmp = scaleBitmapDown(bmp, 1024)
-            bitmap = scaledBmp
             
-            // Run Detection
-            faceMeshHelper.processImage(scaledBmp, 
-                onSuccess = { meshes ->
-                    if (meshes.isNotEmpty()) {
-                        warpView?.setFaceMesh(meshes[0])
-                        Toast.makeText(context, "Face Detected!", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(context, "No face detected.", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                onFailure = {
-                    Toast.makeText(context, "Detection Failed: ${it.message}", Toast.LENGTH_LONG).show()
-                }
-            )
+            // Reset effects
+            eyeEnlargement = 0f
+            chinSlimming = 0f
+            
+            bitmap = scaledBmp
+            detectFace(scaledBmp)
         }
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Button(
-            onClick = { 
-                pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-            },
-            modifier = Modifier.align(Alignment.CenterHorizontally)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            Text("Select Image")
+            Button(onClick = { 
+                pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            }) {
+                Text(if (bitmap == null) "Select Image" else "Change")
+            }
+            
+            if (bitmap != null) {
+                Button(onClick = {
+                    val warpedBmp = warpView?.getWarpedBitmap()
+                    if (warpedBmp != null) {
+                        bitmap = warpedBmp
+                        eyeEnlargement = 0f
+                        chinSlimming = 0f
+                        detectFace(warpedBmp)
+                        Toast.makeText(context, "Applied!", Toast.LENGTH_SHORT).show()
+                    }
+                }) {
+                    Text("Apply")
+                }
+                
+                Button(onClick = {
+                    val finalBmp = warpView?.getWarpedBitmap()
+                    if (finalBmp != null) {
+                        saveBitmapToGallery(context, finalBmp)
+                    }
+                }) {
+                    Text("Save")
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -84,13 +153,15 @@ fun ImageEditorScreen() {
                         }
                     },
                     update = { view ->
-                        // Update view properties when compose state changes
+                        // Only update levels, don't re-setImage here unless the bitmap object itself changed
                         view.eyeEnlargementLevel = eyeEnlargement
                         view.chinSlimmingLevel = chinSlimming
                         
-                        // If bitmap changed (e.g. new selection), update it.
-                        // Ideally checking if it's the same object reference.
-                        // Here we just ensure we set it if needed.
+                        // We use a tag or a simple check to see if we need to reload the bitmap
+                        if (view.tag != bitmap) {
+                            view.setImage(bitmap!!)
+                            view.tag = bitmap
+                        }
                     },
                     modifier = Modifier.fillMaxSize()
                 )
@@ -98,6 +169,7 @@ fun ImageEditorScreen() {
                 Text("No Image Selected", modifier = Modifier.align(Alignment.Center))
             }
         }
+// ... (phần còn lại của code)
         
         Spacer(modifier = Modifier.height(16.dp))
 
